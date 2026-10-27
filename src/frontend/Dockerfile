@@ -41,4 +41,5 @@ COPY ./static ./static
 ENV GOTRACEBACK=single
 
 EXPOSE 8080
+USER 10001:10001
 ENTRYPOINT ["/src/server"]
