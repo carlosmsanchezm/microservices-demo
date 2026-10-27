@@ -31,10 +31,10 @@ spec:
     spec:
       serviceAccountName: frontend
       securityContext:
-        fsGroup: 1000
-        runAsGroup: 1000
+        fsGroup: 10001
+        runAsGroup: 10001
         runAsNonRoot: true
-        runAsUser: 1000
+        runAsUser: 10001
       containers:
         - name: server
           securityContext:

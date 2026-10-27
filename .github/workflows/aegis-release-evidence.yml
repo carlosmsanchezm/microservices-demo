@@ -1,0 +1,158 @@
+name: Aegis release evidence
+on:
+  push:
+    branches: [codex/boutique-evidence-r3]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: boutique-evidence-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        service: [frontend, cartservice, productcatalogservice, currencyservice, paymentservice, shippingservice, emailservice, checkoutservice, recommendationservice, adservice, loadgenerator]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build service and retain image identity
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          context="src/$SERVICE"
+          if [ "$SERVICE" = cartservice ]; then context="src/cartservice/src"; fi
+          mkdir -p reports
+          docker build -t "boutique-$SERVICE:$GITHUB_SHA" "$context" > /tmp/image-build.log 2>&1
+          docker image inspect "boutique-$SERVICE:$GITHUB_SHA" --format '{{.Id}}' > "reports/$SERVICE.digest.txt"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock anchore/syft@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a "docker:boutique-$SERVICE:$GITHUB_SHA" -o cyclonedx-json > "reports/$SERVICE.sbom.json"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c image --scanners vuln --format json --quiet "boutique-$SERVICE:$GITHUB_SHA" > "reports/$SERVICE.image.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.service }}
+          path: reports/
+          retention-days: 14
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Scan code, dependencies, configuration and secrets
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          docker run --rm -v "$PWD:/src:ro" semgrep/semgrep@sha256:3db5c7af55eb1f512eac0abf0ab69a97b52c74b5e9a27314c221aee1a78d7ab2 semgrep scan --config p/default --sarif /src > evidence/sast.json 2>/tmp/semgrep.log
+          docker run --rm -v "$PWD:/src:ro" aquasec/trivy@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c fs --scanners vuln --format json --quiet /src > evidence/dependencies.json
+          docker run --rm -v "$PWD:/src:ro" aquasec/trivy@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c config --format json --quiet /src/kubernetes-manifests > evidence/configuration.json
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src:ro" -v "$PWD/evidence:/out" zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f dir /src --redact --report-format json --report-path /out/secrets.json --exit-code 0 > /tmp/gitleaks.log 2>&1
+          python3 - <<'PYSAFE'
+          import json,pathlib
+          root=pathlib.Path('evidence')
+          p=root/'sast.json';sarif=json.loads(p.read_text())
+          for run in sarif.get('runs',[]):
+            for result in run.get('results',[]):
+              keep={k:result[k] for k in ['ruleId','level'] if k in result}
+              keep['message']={'text':'Scanner rule reported a finding'}
+              keep['locations']=[]
+              for location in result.get('locations',[]):
+                physical=location.get('physicalLocation',{})
+                keep['locations'].append({'physicalLocation':{'artifactLocation':{'uri':physical.get('artifactLocation',{}).get('uri','source')},'region':{'startLine':physical.get('region',{}).get('startLine',1)}}})
+              result.clear();result.update(keep)
+          p.write_text(json.dumps(sarif))
+          for name in ['dependencies.json','configuration.json']:
+            p=root/name;report=json.loads(p.read_text())
+            for result in report.get('Results',[]):
+              result.pop('Packages',None)
+              for key,fields in [('Vulnerabilities',['VulnerabilityID','Severity','PkgName','InstalledVersion','FixedVersion']),('Misconfigurations',['ID','Severity'])]:
+                if key in result:result[key]=[{**{k:f[k] for k in fields if k in f},'StartLine':f.get('CauseMetadata',{}).get('StartLine',1)} for f in result[key]]
+            p.write_text(json.dumps(report))
+          p=root/'secrets.json';p.write_text(json.dumps([{k:f[k] for k in ['RuleID','File','StartLine'] if k in f} for f in json.loads(p.read_text())]))
+          PYSAFE
+          printf '{"unavailable":true,"reason":"Publisher signature was not verified"}\n' > evidence/publisher-signature.json
+          printf '{"unavailable":true,"reason":"Local runner images are not signed"}\n' > evidence/built-image-signature.json
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: aegis-boutique
+      - name: Deploy and probe a throwaway cluster
+        run: |
+          set -euo pipefail
+          docker build -t boutique-frontend:local src/frontend > /tmp/frontend-build.log 2>&1
+          kind load docker-image boutique-frontend:local --name aegis-boutique
+          cp release/kubernetes-manifests.yaml /tmp/boutique-manifests.yaml
+          python3 - <<'PY'
+          import pathlib,re
+          p=pathlib.Path('/tmp/boutique-manifests.yaml')
+          s=p.read_text()
+          s=re.sub(r'image: .*?/frontend:[^\s]+','image: boutique-frontend:local\n          imagePullPolicy: Never',s)
+          p.write_text(s)
+          PY
+          kubectl --context kind-aegis-boutique apply -f /tmp/boutique-manifests.yaml > /tmp/kubectl-apply.log
+          healthy=false
+          if kubectl --context kind-aegis-boutique wait --for=condition=available deployment --all --timeout=600s > /tmp/kubectl-wait.log 2>&1; then
+            kubectl --context kind-aegis-boutique port-forward service/frontend 8080:80 > /tmp/port-forward.log 2>&1 &
+            for attempt in $(seq 1 20); do
+              if curl -fsS -H 'Cookie: shop_session-id=aegis-probe' http://127.0.0.1:8080/_healthz > /dev/null; then healthy=true; break; fi
+              sleep 2
+            done
+          fi
+          kubectl --context kind-aegis-boutique get pods -o json > /tmp/pods.json
+          HEALTHY="$healthy" python3 - <<'PY'
+          import json,os,pathlib
+          pods=json.load(open('/tmp/pods.json'))['items']
+          ready=sum(all(c.get('ready',False) for c in p.get('status',{}).get('containerStatuses',[])) and bool(p.get('status',{}).get('containerStatuses')) for p in pods)
+          pathlib.Path('evidence/runtime.json').write_text(json.dumps({'healthy':os.environ['HEALTHY']=='true','podCount':len(pods),'readyCount':ready}))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-scans
+          path: evidence/
+          retention-days: 14
+      - name: Remove throwaway cluster
+        if: always()
+        run: kind delete cluster --name aegis-boutique
+  summarize:
+    needs: [images, collect]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: source-scans
+          path: evidence
+      - name: Publish a checksummed evidence summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .run_started_at > /tmp/observed-at
+          python3 - <<'PY'
+          import json,pathlib,os,hashlib
+          out=pathlib.Path('evidence');images=pathlib.Path('images')
+          results=[];components=[];identities={}
+          for file in sorted(images.glob('*.image.json')): results.extend(json.loads(file.read_text())['Results'])
+          for file in sorted(images.glob('*.sbom.json')): components.extend(json.loads(file.read_text()).get('components',[]))
+          for file in sorted(images.glob('*.digest.txt')): identities[file.stem]=file.read_text().strip()
+          (out/'image.json').write_text(json.dumps({'Results':results}))
+          (out/'sbom.cdx.json').write_text(json.dumps({'bomFormat':'CycloneDX','specVersion':'1.6','version':1,'components':components}))
+          (out/'summary.json').write_text(json.dumps({'repository':os.environ['GITHUB_REPOSITORY'],'runId':os.environ['GITHUB_RUN_ID'],'commit':os.environ['GITHUB_SHA'],'observedAt':pathlib.Path('/tmp/observed-at').read_text().strip(),'images':identities,'scope':'all eleven services','deploymentApproval':None}))
+          manifest={f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(out.iterdir()) if f.is_file()}
+          (out/'manifest.json').write_text(json.dumps(manifest,sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aegis-evidence
+          path: evidence/
+          retention-days: 14
