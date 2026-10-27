@@ -52,7 +52,7 @@ jobs:
           docker run --rm -v "$PWD:/src:ro" semgrep/semgrep@sha256:3db5c7af55eb1f512eac0abf0ab69a97b52c74b5e9a27314c221aee1a78d7ab2 semgrep scan --config p/default --sarif /src > evidence/sast.json 2>/tmp/semgrep.log
           docker run --rm -v "$PWD:/src:ro" aquasec/trivy@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c fs --scanners vuln --format json --quiet /src > evidence/dependencies.json
           docker run --rm -v "$PWD:/src:ro" aquasec/trivy@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c config --format json --quiet /src/kubernetes-manifests > evidence/configuration.json
-          docker run --rm -v "$PWD:/src:ro" -v "$PWD/evidence:/out" zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f dir /src --redact --report-format json --report-path /out/secrets.json --exit-code 0 > /tmp/gitleaks.log 2>&1
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/src:ro" -v "$PWD/evidence:/out" zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f dir /src --redact --report-format json --report-path /out/secrets.json --exit-code 0 > /tmp/gitleaks.log 2>&1
           python3 - <<'PYSAFE'
           import json,pathlib
           root=pathlib.Path('evidence')
